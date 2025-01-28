@@ -1,300 +1,345 @@
-"""
-SummaryEngine --> Engine
-ExtractEngine --> Engine
-Engine is capable of tuning the design of extracting feature. This samplize how to extract the feature 
-follow the rule
-"""
-from timely import *
-from dimension import *
-from entity import *
-from fact import *
-from aggregation_unit import *
+import re
+import itertools
+import pyspark.sql.functions as F
+import copy
+from functools import reduce
+from typing import Union
+from datetime import date
+from pyspark.sql.dataframe import DataFrame
 
+from .feature import Feature, AggFeature
+from .timely import Daily, Monthly
+from .aggregation_unit import MAPPING_AGG_DESC
 
-class Engine:
+class FSKitSession:
     def __init__(
         self,
-        spark,
-        base_path: str,
-        output_path: str,
-        partition_col: str,
-        entity: Entity,
-        mapping_dim: Dict[str, Dim],
-        mapping_fact: Dict[str, Fact],
-        base_agg: List[AggregationUnit],
-        summary_agg: List[AggregationUnit]
+        df: DataFrame,
+        source: str,
+        target_entity: Union[str, list[str], tuple[str]],
+        dims: list,
+        aggs: list,
+        time_index: str = None,
     ) -> None:
-        self.spark = spark
-        self.base_path = base_path
-        self.output_path = output_path
-        self.partition_col = partition_col
-        self.mapping_entity = entity
-        self.mapping_dim = mapping_dim
-        self.mapping_fact = mapping_fact
-        self.base_agg = base_agg
-        self.summary_agg = summary_agg
-        
-        self._data_date: Union[datetime, datetime.date]
-        self._timely_source: Timely
-        self._timely_target: Timely
-        self._dim_combs: List[List[str]] = []
+        """
+        Initialize a FSKitSession Object.
 
+        :param df: The api acts as Pyspark DataFrame
+        :param target_column: The target column for the aggregation.
+        :param alias: Alias for the result of the aggregation.
+        :param desc: The script describes the actual meaning of the target columns
+        """
+        self.df = df
+        self.source = source
+        self.target_entity: list[str] = list(target_entity)
+        self.dims = dims
+        self.aggs = aggs
+        self.time_index = time_index
 
-    
-    def get_input_df(self) -> Dict[List[str], "DataFrame"]:
-        try:
-            self._timely_source
-            self._data_date
-            self._dim_combs
-        except:
-            raise ValueError("Missing Inputs, Denpendency timely is not declared.")
+        # Internal param
+        self._window_slide = None
 
-        dims_combs_dict = {}
-        
-        if self._timely_source == self._timely_target:
-            input_df = self.spark.read.option("partitionCol", self.partition_col).parquet(self.base_path)\
-            .filter(F.col(f"{self.partition_col}").between(self._data_date, self._data_date))
+    def __getattr__(self, name: str) -> None:
+        # List the name of attributes follow the window slides
+        att_day_list = [f"l{x}d" for x in range(1, 36501)]
+        att_month_list = [f"l{x}m" for x in range(1, 121)]
 
-            for dim_comb in self._dim_combs:
-                dims_combs_dict[".".join(dim_comb)] = input_df
+        att_list = att_day_list + att_month_list
+        if name in att_list:
+            window_slide_num = int(name[1:-1])
+            temp_obj = copy.copy(self)
+            if name in att_day_list:
+                temp_obj._window_slide = Daily(window_slide_num)
+            elif name in att_month_list:
+                temp_obj._window_slide = Monthly(window_slide_num)
+            return temp_obj
         else:
-            input_path = (self.output_path if self.output_path.endswith("/") else self.output_path + "/")\
-            + "summary_layer"\
-            + f"last_{self._timely_source.time_range}_{self._timely_source.time_type}"
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
 
-            for dim_comb in self._dim_combs:
-                if self._timely_source.time_type == self._timely_target.time_type:
-                    input_df = self.spark.read.option("partitionCol", self.partition_col).parquet(input_path + ".".join(dim_comb))\
-                    .filter(F.col(f"{self.partition_col}").between(self._data_date - eval(f"relativedelta({self._timely_target.time_type}s={self._timely_target.time_range})")\
-                                                              + eval(f"relativedelta({self._timely_source.time_type}s={self._timely_source.time_range})"), 
-                                                              self._data_date))
-                else:
-                    input_df = self.spark.read.option("partitionCol", self.partition_col).parquet(input_path + ".".join(dim_comb))\
-                    .filter(F.col(f"{self.partition_col}").between(self._data_date - eval(f"relativedelta({self._timely_target.time_type}s={self._timely_target.time_range})"), 
-                                                              self._data_date - eval(f"relativedelta({self._timely_source.time_type}s={self._timely_source.time_range})")))
-                
-                dims_combs_dict[".".join(dim_comb)] = input_df
-            
-        
-        return dims_combs_dict
-        
-        
-    def data_date(self, data_date) -> "Engine":
+    def _normalize_naming(self, input_string):
         """
-        Set the data_date which is the time when extract the Feature Store
+        Normalize a string to camelCase.
+
+        Params
+        ------
+        input_string: str
+            Input String
+        Return
+        ------
+        :str
+            Normalized camelCase String
         """
-        self._data_date = data_date
-        return self
+        # Condition to be normalized
+        if input_string == "" or input_string is None:
+            return input_string
 
+        # Split by any non-aphanumeric character
+        words = re.split(r"[^a-zA-Z0-9]", input_string)
+        words = [w.lower() for w in words]
 
-    def combine_dimensions(self, *args):
+        # Convert to camelCase
+        normalized_output = reduce(
+            lambda accumulated_arg, cur_arg: accumulated_arg
+            + cur_arg[0].upper()
+            + cur_arg[1:],
+            words[1:],
+            words[0],
+        )
+
+        return normalized_output
+
+    def _normalized_dataframe(self, df) -> DataFrame:
         """
-        Get the dims' combinations to extract the neccessary features.
+        Normalize Dataframe
+
+        Params
+        ------
+        df: DataFrame
+            Input Dataframe
+
+        Return
+        ------
+        DataFrame
+            Normalized the dimensions of current dataframe
         """
-        dims_comb = []
-        for i in range(len(args)):
-            dims_comb.append(args[i])
+        rollup_df = df
+        normalized_dim_cond = [
+            reduce(
+                lambda accumulated_arg, cur_arg: accumulated_arg.when(
+                    F.col(dim.dim_name) == F.lit(cur_arg),
+                    F.lit(self._normalize_naming(cur_arg)),
+                ),
+                dim.dim_values,
+                F.when(F.lit(False), F.lit(None)),
+            ).otherwise(F.col(dim.dim_name))
+            for dim in self.dims
+        ]
 
-        self._dim_combs.append(dims_comb)
+        dim_cols = [d.dim_name for d in self.dims]
+        for dim_col, nor_cond in zip(dim_cols, normalized_dim_cond):
+            rollup_df = rollup_df.withColumn(dim_col, nor_cond)
 
-        return self
-    
+        return rollup_df
 
-    def dependency(self, timely_source: Timely, timely_target: Timely) -> "Engine":
+    def roll_up_dataframe(self, observe_date: date = None) -> DataFrame:
         """
-        Set timely dependency to the source of Data
+        Summary to the `dimension` level
+
+        Params
+        ------
+        observe_date: date
+            The flag date that we look back.
+
+        Return
+        ------
+        DataFrame
+            Pyspark Dataframe contain
         """
-        self._timely_source = timely_source
-        self._timely_target = timely_target
-        self._validate_startup_dependency()
-
-        return self
-
-
-    def _validate_startup_dependency(self) -> None:
-        ...
-    
-
-    def summary_layer(self):
-        
-        input_df_dict = self.get_input_df()
-
-        res = []
-        
-        if self._timely_source == self._timely_target:
-            list_agg = [i.grouped_col() for i in self.base_agg]
+        # Filtering the input dataframe
+        if self.time_index is None:
+            input_df = self.df
         else:
-            list_agg = self.summary_agg
+            try:
+                _filter_qry = (
+                    F.col(self.time_index)
+                    >= (observe_date - self._window_slide.get_timedelta())
+                ) & (F.col(self.time_index) < observe_date)
+                input_df = self.df.filter(_filter_qry)
+            except Exception:
+                raise Exception(
+                    "Missing param `observe_date` for the function or `time_index` for the object `FSKitSession`!"
+                )
 
-        entity_cols = self.mapping_entity.keys
-        for inputs in input_df_dict.items():
-            dim_comb = inputs[0]
-            df = inputs[1]
-            if dim_comb == "":
-                dim_comb = []
-            else:
-                dim_comb = inputs[0].split(".")    # List[str]
-            grouped_cols = [*entity_cols, *dim_comb]
-            
-            ret_df = df.groupBy(grouped_cols).agg(*list_agg)
-                
-            ret_path = (self.output_path if self.output_path.endswith("/") else self.output_path + "/")\
-            + "/".join(["summary_layer", f"last_{self._timely_target.time_range}_{self._timely_target.time_type}"])
+        # Filtering all the Dimension we need
+        for d in self.dims:
+            filter_query = F.col(d.dim_name).isin(d.dim_values)
+            input_df = input_df.filter(filter_query)
 
-            res.append((ret_df, ret_path, self._timely_source, self._timely_target
-                        , self._data_date.strftime(self._timely_target.format)))
-        
-        return res
-        
+        # Extract the grouped columns
+        target_entity = self.target_entity
+        dimensions = [d.dim_name for d in self.dims]
 
+        # Grouped Columns & Aggregations
+        grouped_cols = list(target_entity.__add__(dimensions))
+        grouped_aggregations = [agg.build() for agg in self.aggs]
 
-    def feature_layer(self):
-        ...
+        # Dim Fact Roll Ups
+        return input_df.groupBy(grouped_cols).agg(*grouped_aggregations)
 
-
-
-
-class FS:
-    
-    def __init__(
-        self,
-        spark: SparkSession,
-        input_path: str,
-        output_path: str,
-        partition_col: str
-    ) -> None:
-        self.spark = spark
-        self.input_path = input_path
-        self.output_path = output_path
-        self.partition_col = partition_col
-
-        self._timely: Timely = None
-        self._entity: Entity = None
-        self._dimension: List[Dim] = []
-        self._fact: List[Fact] = []
-        self._base_agg: List[AggregationUnit] = []
-        self._summary_agg: List[AggregationUnit] = []
-
-        self.engine: Engine = None
-        
-
-
-    def set_engine(self):
-        ret_engine=  Engine(self.spark,
-                            self.input_path,
-                            self.output_path,
-                            self.partition_col,
-                            self._entity,
-                            self.get_dimension_mapping(),
-                            self.get_fact_mapping(),
-                            self._base_agg,
-                            self._summary_agg)
-
-        self.engine = ret_engine
-
-        return self
-
-
-    def define_timely(self, timely:Timely):
-        self._timely = timely
-
-        return self
-        
-
-    def entity(self, 
-               name: str, 
-               ref_cols: List[str], 
-               desc: str=""):
-        self._entity = Entity(name=name, keys=ref_cols, description=desc)
-
-        return self
-
-
-    def dimension(self, 
-                  col_name: str, 
-                  accepted_values: List[str], 
-                  desc=None) -> "FS":
-        if desc is None:
-            self._dimension.append(Dim(col_name=col_name, accepted_values=accepted_values))
-        else:
-            self._dimension.append(Dim(col_name=col_name, accepted_values=accepted_values, descriptions=desc))
-
-        return self
-
-
-    def fact(self, 
-             name: str, 
-             ref_cols: Optional[List[str]], 
-             desc: str=""):
-        self._fact.append(Fact(name=name, ref_cols=ref_cols, description=desc))
-
-        return self
-
-
-    def get_entity(self):
+    def extract_feature(self, observe_date: date = None) -> DataFrame:
         """
-        Return the mapping of entity's name to its corresponding object.
-        
+        Extract all the features in a FS session
+
+        Params
+        ------
+        observe_date: date
+            The flag date that we look back.
+
+        Return
+        ------
+        DataFrame
+            Pyspark Dataframe contain all the features that extracted from the FSSession/
         """
-        return self._entity
+        # Get all the aggregations, metric columns or the alias we named in the AggregationUnit object
+        grouped_aggregations = self.aggs
+        agg_funcs = [
+            self._normalize_naming(agg.agg_function) for agg in grouped_aggregations
+        ]
+        metric_columns = [
+            self._normalize_naming(agg.alias) for agg in grouped_aggregations
+        ]
+        dim_cols = [dim.dim_name for dim in self.dims]
 
+        # Get roll_up dataframe, normalized the roll_up dataframe
+        rollup_df = self.roll_up_dataframe(observe_date=observe_date)
+        rollup_df = self._normalized_dataframe(rollup_df)
 
-    def get_dimension_mapping(self):
+        # Extract window slides features
+        output_df = (
+            rollup_df.withColumn(
+                "_pivot_col",
+                F.concat_ws(
+                    "_",
+                    F.lit(self._normalize_naming(self.source)),
+                    *[F.col(d) for d in dim_cols],
+                ),
+            )
+            .groupBy(self.target_entity)
+            .pivot("_pivot_col")
+            .agg(
+                *[
+                    F.first(F.col(_col)).alias(
+                        "_".join(
+                            [
+                                self._normalize_naming(_col),
+                                _agg,
+                                str(self._window_slide),
+                            ]
+                            if self._window_slide is not None
+                            else [self._normalize_naming(_col), _agg]
+                        )
+                    )
+                    for _agg, _col in zip(agg_funcs, metric_columns)
+                ]
+            )
+        )
+
+        return output_df
+
+    def get_dim_info(self):
         """
-        Return the mapping of dimension's column-name to its corresponding object.
-        
+        Generate dimension combinations and their metadata.
+
+        Returns
+        -------
+        list[list[str]]
+            return a list of (dim_value, dc_name, dc_desc). In the return list of
+            dim_value contains of `dim_name: dim_value`; dc_name: combination of
+            dim value connected by `_`; dc_desc: dims combination description in VNese.
         """
-        mapping_dimension = dict()
-        for dim_obj in self._dimension:
-            mapping_dimension[dim_obj.col_name] = dim_obj
-        return mapping_dimension
+        # Assign list of values of all the dimensions to `dim_combs` variable
+        dim_combs = list(
+            itertools.product(
+                *[
+                    [(d, self._normalize_naming(n_d)) for n_d in d.dim_values]
+                    for d in self.dims
+                ]
+            )
+        )
+        # Assign the description for dimensions combination
+        dim_meanings = list(
+            itertools.product(
+                *[[d.dim_description[n_d] for n_d in d.dim_values] for d in self.dims]
+            )
+        )
+        # Extract all the dimensions information into a list[tuple]
+        dim_info = []
+        for dc, dm in zip(dim_combs, dim_meanings):
+            dim_value = {_d[0]: _d[1] for _d in dc}
+            dc_name = "_".join([_d[1] for _d in dc])
+            dc_desc = " ".join(dm)
+            dim_info.append([dim_value, dc_name, dc_desc])
 
+        return dim_info
 
-    def get_fact_mapping(self):
+    def get_agg_info(self):
         """
-        Return the mapping of fact's name to its corresponding object.
-        
+        Generate aggregation unit descriptions.
+
+        Returns
+        -------
+        list[dict]
+            Return aggregation information which is a list of multiple dicts
+            each contains the name of aggregation and the description of the
+            aggregation itself
         """
-        mapping_fact = dict()
-        for fact_obj in self._fact:
-            mapping_fact[fact_obj.name] = fact_obj
-        return mapping_fact
+        agg_info = []
+        for agg in self.aggs:
+            agg_desc = " ".join(
+                [
+                    MAPPING_AGG_DESC[self._normalize_naming(agg.agg_function)],
+                    agg.desc,
+                ]
+            )
+            agg_info.append([agg, agg_desc])
+        return agg_info
 
-
-    def aggregate(self,
-                  func_name: str, 
-                  fact_name: str,
-                  main_function:bool=False):
+    def get_agg_features(self, observe_date: date) -> list[Feature]:
         """
-        Aggregate function to load all the configs to the AggregationUnit Class, 
-        Notes: fact_name ~ fact's name (only 1 string)
+        Store the window features extracted in the session to the list
         """
-        mapping_fact = self.get_fact_mapping()
-        fact_obj = mapping_fact[fact_name]
+        # Get all the information needed
+        source = self.source
+        target_entity = self.target_entity
 
-        self._base_agg.append(AggregationUnit(cols=fact_obj.ref_cols,
-                                              function=func_name,
-                                              alias="_".join([func_name, fact_name])))
-        self._summary_agg.append(AggregationUnit(cols=fact_obj.ref_cols,
-                                                 function=func_name,
-                                                 alias="_".join([func_name, fact_name])))
-        
-        if main_function:
-            ref_funcs = ["sum", "avg", "min", "max"]
-            ref_funcs.remove(func_name)
-            for tmp_func in ref_funcs:
-                self._summary_agg.append(AggregationUnit(cols=fact_obj.ref_cols,
-                                                      function=tmp_func,
-                                                      alias="_".join([tmp_func, func_name, fact_name])))
+        # Get all the dimension info
+        dim_info = self.get_dim_info()
 
+        # Get all the aggregation info
+        agg_info = self.get_agg_info()
 
-        return self
+        full_info = list(itertools.product(dim_info, agg_info))
+        feature_objs = []
+        for info in full_info:
+            # Gather all the window feature information
+            dim_info = info[0]
+            agg_info = info[1]
+            ft_name = "_".join(
+                [
+                    source,
+                    dim_info[1],
+                    "_".join(
+                        [
+                            self._normalize_naming(agg_info[0].alias),
+                            self._normalize_naming(agg_info[0].agg_function),
+                        ]
+                    ),
+                ]
+            ) + ("" if self._window_slide is None else "_" + str(self._window_slide))
 
-    
+            dim_value = dim_info[0]
+            ft_description = " ".join(
+                [
+                    agg_info[-1],
+                    dim_info[-1],
+                    "" if self._window_slide is None else self._window_slide.__repr__(),
+                ]
+            )
+            window_agg = agg_info[0]
 
+            # create object and send it to the return list
+            ft = AggFeature(
+                name=ft_name,
+                source=source,
+                target_entity=target_entity,
+                dim_value=dim_value,
+                description=ft_description,
+                observe_date=observe_date,
+                window_agg=window_agg,
+                window_slide=self._window_slide,
+            )
+            feature_objs.append(ft)
 
-    """
-    It can be read(), write(), ...
-    """
-    ...
-
+        return feature_objs
